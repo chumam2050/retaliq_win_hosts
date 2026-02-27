@@ -7,7 +7,10 @@ param(
     [string] $Password = ''
 )
 
-if (-not (Test-Path $ExePath)) {
+try {
+    $ExePathResolved = (Resolve-Path -Path $ExePath -ErrorAction Stop).Path
+}
+catch {
     Write-Error "Executable not found at $ExePath. Publish the project first to create the binary."
     exit 1
 }
@@ -66,9 +69,10 @@ if ($LASTEXITCODE -eq 0) {
         sc.exe description $ServiceName `"$Description`" | Out-Null
     }
 
-    Write-Output "Service created. Starting service..."
-    Start-Service -Name $ServiceName
-    Write-Output "Service started."
+    Write-Output "Service created. Sending start request..."
+    # Use sc.exe start to avoid PowerShell Start-Service blocking if the service does not reach Running state
+    sc.exe start $ServiceName | Out-Null
+    Write-Output "Start request sent. The service may take a moment to reach Running state."
 } else {
     Write-Error "Failed to create service"
 }

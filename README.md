@@ -54,20 +54,16 @@ An unregister script is provided at `tools/unregister-service.ps1` to stop and r
 ```
 
 ## Client
-No client is included in the repository. Use any TCP tool to send a single-line base64-encoded JSON payload to `127.0.0.1:8888` (or override with `RETALIQ_PORT`).
+No client is required; a simple HTTP receiver is available at `http://127.0.0.1:5000/hosts`.
 
-Example using PowerShell to send an array payload:
+Use `curl` to send JSON directly to the HTTP endpoint. A helper script is included at `tools/test-curl.sh`.
 
-```powershell
-$json = '["test1.mydomain.test","test2.mydomain.test","test3.,mydomain.test"]'
-$b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
-$tcp = New-Object System.Net.Sockets.TcpClient('127.0.0.1', 8888)
-$stream = $tcp.GetStream()
-$writer = New-Object System.IO.StreamWriter($stream, [Text.Encoding]::UTF8)
-$writer.AutoFlush = $true
-$writer.WriteLine($b64)
-$writer.Dispose()
-$tcp.Close()
+Example using curl (service now listens on port 8888 and binds 0.0.0.0):
+
+```bash
+curl -v -X POST http://127.0.0.1:8888/hosts \
+  -H "Content-Type: application/json" \
+  --data-raw '["test1.mydomain.test","test2.mydomain.test","test3.,mydomain.test"]'
 ```
 
 ## Security

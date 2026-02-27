@@ -77,8 +77,25 @@ if (-not (Test-Path $candidatePath)) {
 
 $exePath = Join-Path $candidatePath $ExeName
 if (-not (Test-Path $exePath)) {
-    Write-Error "Executable not found at '$exePath'. Please publish the project into the build subfolder before running this script."
-    exit 1
+    Write-Warning "Executable not found at expected path '$exePath'. Searching recursively under '$candidatePath'..."
+    $found = Get-ChildItem -Path $candidatePath -Filter $ExeName -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($found) {
+        $exePath = $found.FullName
+        Write-Output "Found executable at '$exePath'."
+    }
+    else {
+        Write-Warning "Not found under arch folder. Searching entire build directory '$fullBuildDir'..."
+        $foundAll = Get-ChildItem -Path $fullBuildDir -Filter $ExeName -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($foundAll) {
+            $exePath = $foundAll.FullName
+            Write-Output "Found executable at '$exePath'."
+        }
+        else {
+            Write-Error "Executable '$ExeName' not found under '$fullBuildDir'. Please publish the project into the build folder before running this script."
+            Write-Output "Contents (top-level):`n$(Get-ChildItem -Path $fullBuildDir | ForEach-Object { $_.Name })"
+            exit 1
+        }
+    }
 }
 
 $registerScript = Join-Path (Split-Path -Parent $PSCommandPath) "register-service.ps1"
@@ -89,19 +106,43 @@ if (-not (Test-Path $registerScript)) {
 
 Write-Output "Registering service using executable: $exePath"
 
-# Build invocation for register-service.ps1
-$invokeArgs = @()
-$invokeArgs += "-ExePath `"$(Resolve-Path $exePath)`""
-$invokeArgs += "-ServiceName `"$ServiceName`""
-$invokeArgs += "-DisplayName `"$DisplayName`""
-$invokeArgs += "-Description `"$Description`""
-if ($Username) { $invokeArgs += "-Username `"$Username`"" }
-if ($Password) { $invokeArgs += "-Password `"$Password`"" }
-if ($Force) { $invokeArgs += "-Force" }
+# Build invocation for register-service.ps1 using direct parameter passing to avoid quoting issues
+    Write-Output "Executing register script with resolved parameters..."
 
-$cmd = "$registerScript " + ($invokeArgs -join ' ')
+    $resolvedExe = (Resolve-Path $exePath).Path
 
-Write-Output "Executing: $cmd"
-& $registerScript @($invokeArgs) | Out-Default
+    try {
+        if ($Username -and $Password) {
+            & $registerScript -ExePath $resolvedExe -ServiceName $ServiceName -DisplayName $DisplayName -Description $Description -Username $Username -Password $Password -ErrorAction Stop | Out-Default
+        }
+        elseif ($Username) {
+            # let register script prompt for password if not provided
+            & $registerScript -ExePath $resolvedExe -ServiceName $ServiceName -DisplayName $DisplayName -Description $Description -Username $Username -ErrorAction Stop | Out-Default
+        }
+        else {
+            & $registerScript -ExePath $resolvedExe -ServiceName $ServiceName -DisplayName $DisplayName -Description $Description -ErrorAction Stop | Out-Default
+        }
+    }
+    catch {
+        Write-Warning "Register script reported an error: $_"
+    }
 
-Write-Output "Done." 
+    # Add Windows Firewall rule to allow HTTP on 8888 so WSL/Docker can reach the service
+    if ($IsWindows) {
+        try {
+            $ruleName = 'RetaliqHosts HTTP'
+            $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+            if (-not $existing) {
+                Write-Output "Creating Windows Firewall rule: $ruleName (port 8888)"
+                New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -LocalPort 8888 -Protocol TCP -Action Allow -Profile Private,Public -ErrorAction Stop | Out-Null
+            }
+            else {
+                Write-Output "Firewall rule '$ruleName' already exists"
+            }
+        }
+        catch {
+            Write-Warning "Failed to add firewall rule: $_"
+        }
+    }
+
+    Write-Output "Done."
