@@ -1,0 +1,17 @@
+bin/
+obj/
+publish/
+*.user
+*.suo
+.vs/
+*.log
+*.bak
+*.retaliq.bak
+*.db
+*.pfx
+
+# Rider
+.idea/
+
+# Visual Studio Code
+.vscode/
