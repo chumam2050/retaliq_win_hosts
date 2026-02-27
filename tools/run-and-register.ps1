@@ -7,6 +7,8 @@ param(
     [string] $Description = "Service that updates Windows hosts based on received payloads",
     [string] $Username = '',
     [string] $Password = '',
+    [string] $AllowedIps = '',
+    [string] $ApiKey = '',
     [switch] $Force
 )
 
@@ -111,21 +113,17 @@ Write-Output "Registering service using executable: $exePath"
 
     $resolvedExe = (Resolve-Path $exePath).Path
 
-    try {
-        if ($Username -and $Password) {
-            & $registerScript -ExePath $resolvedExe -ServiceName $ServiceName -DisplayName $DisplayName -Description $Description -Username $Username -Password $Password -ErrorAction Stop | Out-Default
-        }
-        elseif ($Username) {
-            # let register script prompt for password if not provided
-            & $registerScript -ExePath $resolvedExe -ServiceName $ServiceName -DisplayName $DisplayName -Description $Description -Username $Username -ErrorAction Stop | Out-Default
-        }
-        else {
-            & $registerScript -ExePath $resolvedExe -ServiceName $ServiceName -DisplayName $DisplayName -Description $Description -ErrorAction Stop | Out-Default
-        }
+    $params = @{
+        ExePath = $resolvedExe
+        ServiceName = $ServiceName
+        DisplayName = $DisplayName
+        Description = $Description
     }
-    catch {
-        Write-Warning "Register script reported an error: $_"
-    }
+
+    if ($Username -and $Password) { $params.Username = $Username; $params.Password = $Password }
+    elseif ($Username) { $params.Username = $Username }
+
+    & $registerScript @params -ErrorAction Stop | Out-Default
 
     # Add Windows Firewall rule to allow HTTP on 8888 so WSL/Docker can reach the service
     if ($IsWindows) {
@@ -143,6 +141,33 @@ Write-Output "Registering service using executable: $exePath"
         catch {
             Write-Warning "Failed to add firewall rule: $_"
         }
+    }
+
+    # Set environment variables for service (RETALIQ_ALLOWED_IPS and RETALIQ_API_KEY)
+    try {
+        $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+        $existing = Get-ItemProperty -Path $regPath -Name "Environment" -ErrorAction SilentlyContinue
+        $envs = @()
+        if ($existing) { $envs = $existing.Environment }
+
+        if ($AllowedIps) {
+            Write-Output "Preparing RETALIQ_ALLOWED_IPS for service $ServiceName"
+            $envs = $envs | Where-Object { -not ($_ -like 'RETALIQ_ALLOWED_IPS=*') }
+            $envs += "RETALIQ_ALLOWED_IPS=$AllowedIps"
+        }
+        if ($ApiKey) {
+            Write-Output "Preparing RETALIQ_API_KEY for service $ServiceName"
+            $envs = $envs | Where-Object { -not ($_ -like 'RETALIQ_API_KEY=*') }
+            $envs += "RETALIQ_API_KEY=$ApiKey"
+        }
+
+        if ($envs.Count -gt 0) {
+            Set-ItemProperty -Path $regPath -Name "Environment" -Value $envs -Force
+            Write-Output "Service environment variables updated. Restart the service to apply them."
+        }
+    }
+    catch {
+        Write-Warning "Failed to set service environment variables: $_"
     }
 
     Write-Output "Done."

@@ -66,6 +66,22 @@ foreach ($rid in $RIDs) {
     }
 
     Write-Output "Published $rid -> $outDir"
+
+    # Create a zip archive of the published output
+    try {
+        $zipPath = Join-Path $rootOut ("$rid.zip")
+        if (Test-Path $zipPath) {
+            if ($Force) { Remove-Item -Path $zipPath -Force }
+            else { Write-Output "Zip already exists at $zipPath (use -Force to overwrite). Skipping zip."; continue }
+        }
+
+        Write-Output "Creating zip archive: $zipPath"
+        Compress-Archive -Path (Join-Path $outDir '*') -DestinationPath $zipPath -Force
+        Write-Output "Created archive: $zipPath"
+    }
+    catch {
+        Write-Warning ("Failed to create zip for {0}: {1}" -f $outDir, $_)
+    }
 }
 
 Write-Output "All done."

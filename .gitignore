@@ -15,3 +15,8 @@ publish/
 
 # Visual Studio Code
 .vscode/
+
+# Ignore build outputs but keep zipped archives
+build/
+!build/*.zip
+!build/**/*.zip
