@@ -1,74 +1,56 @@
 # RetaliqHosts
 
-RetaliqHosts is a .NET Worker Service that listens on localhost for base64-encoded JSON messages describing host entries to add to the Windows `hosts` file. It inserts or replaces named blocks inside the hosts file.
+RetaliqHosts is a .NET 8 Worker Service that receives JSON payloads and applies host entries into the Windows `hosts` file. It must run as Administrator on Windows because it updates `%SystemRoot%\System32\drivers\etc\hosts`.
 
-Important: This service must run as Administrator on Windows because it modifies `%SystemRoot%\System32\drivers\etc\hosts`.
+This repository contains an interactive `setup.ps1` that consolidates the service registration, environment management and common helper actions.
 
-## How it works
-- The service listens on `127.0.0.1` and port `8888` by default (change `RETALIQ_PORT` env var to override).
-- Send a single-line base64-encoded JSON payload to the listener. The service decodes and parses the payload and will insert/update a block in the hosts file.
-- Payload forms supported:
-  - Top-level JSON array of hostnames: `["a.test","b.test"]` — the service will create two lines:
-    - `127.0.0.1 a.test b.test`
-    - `::1 a.test b.test`
-    The block name will default to `inline` or the value of `RETALIQ_DEFAULT_BLOCK` env var.
-  - JSON object: `{"BlockName":"myblock","Entries":["a.test","b.test"]}` or with `Content`.
+Current status
+- Service registration and management consolidated into `setup.ps1` (preferred entrypoint for installing/uninstalling, reloading env and rotating API key).
+- `.env` is ignored by Git (listed in `.gitignore`) and has been removed from the repository to avoid leaking secrets.
+- Environment values (`RETALIQ_API_KEY`, `RETALIQ_ALLOWED_IPS`) are written to the Windows Service registry `Environment` as `REG_MULTI_SZ` so the service inherits them on start.
 
-## Running the service
-You must run the service as Administrator on Windows.
+Quick usage (recommended)
+1. Open an elevated (Administrator) PowerShell in the repository root.
+2. Run `.\n+   .\setup.ps1` and choose from the interactive menu:
+   - `1) Register service` — register and start the service (finds executable under `build/<arch>`).
+   - `2) Unregister service` — stop and remove the service and cleanup the registry.
+   - `3) Reload service` — reapply `.env` values to the service registry and restart the service.
+   - `4) Regenerate API key` — rotate the `RETALIQ_API_KEY` value in `.env` and apply it to the running service.
 
-To run from source (Developer):
-1. Open an elevated (Administrator) PowerShell or Cmd prompt.
-2. Build and run:
+Developer run
+1. Build and run locally (development):
    - `dotnet build`
    - `dotnet run --project RetaliqHosts.csproj`
 
-To run as a Windows Service:
-1. Publish the app: `dotnet publish -c Release -r win-x64 --self-contained false -o publish`.
-2. A small helper script is provided at `tools/register-service.ps1` which will register and start the service for you. Run the script from an elevated PowerShell prompt:
+Publish & install
+1. Publish the app for Windows (example):
+   ```powershell
+   dotnet publish -c Release -r win-x64 --self-contained false -o publish
+   ```
+2. Use `setup.ps1` -> `Register service` to register the published binary. `setup.ps1` searches for the executable under `build/<arch>` and `publish` outputs when registering.
 
-```powershell
-Set-Location <project-root>
-.
-\tools\register-service.ps1 -ExePath "$(Resolve-Path publish\RetaliqHosts.exe)"
-```
+HTTP receiver and testing
+- The service exposes an HTTP endpoint (default `http://0.0.0.0:8888/hosts`).
+- Requests are accepted only from IPs listed in `RETALIQ_ALLOWED_IPS`. When `RETALIQ_API_KEY` is set the header `X-Api-Key: <key>` is required.
 
-The script will remove an existing service with the same name, register the new service, and start it. By default it creates a service named `RetaliqHosts` running as `LocalSystem`.
-
-### Register with specific account
-The registration script accepts `-Username` and `-Password` parameters to run the service under a specific user. If you omit `-Password` the script will prompt you for the password securely.
-
-Example:
-
-```powershell
-.
-\tools\register-service.ps1 -ExePath "$(Resolve-Path publish\RetaliqHosts.exe)" -Username "DOMAIN\user" -Password "p@ssw0rd"
-```
-
-### Unregistering the service
-An unregister script is provided at `tools/unregister-service.ps1` to stop and remove the service:
-
-```powershell
-.
-\tools\unregister-service.ps1 -ServiceName RetaliqHosts
-```
-
-## Client
-No client is required; a simple HTTP receiver is available at `http://127.0.0.1:5000/hosts`.
-
-Use `curl` to send JSON directly to the HTTP endpoint. A helper script is included at `tools/test-curl.sh`.
-
-Example using curl (service now listens on port 8888 and binds 0.0.0.0):
-
+Example curl (with API key):
 ```bash
-curl -v -X POST http://127.0.0.1:8888/hosts \
+curl -v -X POST "http://host.docker.internal:8888/hosts" \
   -H "Content-Type: application/json" \
-  --data-raw '["test1.mydomain.test","test2.mydomain.test","test3.,mydomain.test"]'
+  -H "X-Api-Key: <your-api-key>" \
+  --data-raw '["a.test","b.test"]'
 ```
 
-## Security
-- Listener binds to `127.0.0.1` by design. Exposing it to external networks is not recommended without proper authentication and TLS.
+Security notes
+- Keep `.env` out of source control (it is ignored). If secrets were pushed earlier rotate them and consider history cleanup (BFG or git-filter-repo).
+- `setup.ps1` writes environment values under the service registry as `REG_MULTI_SZ` so values are available to the service process at start.
 
-## Notes
-- The service will stop automatically if it does not detect Administrator privileges or if not running on Windows.
-- The hosts file is modified atomically and a backup `hosts.retaliq.bak` is created when changes are applied.
+Troubleshooting
+- If the service doesn't start, check the Windows Application event log for .NET Runtime errors and run the EXE directly in an elevated console to see startup exceptions.
+- To verify the service registry environment run in an elevated PowerShell:
+  ```powershell
+  (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\RetaliqHosts' -Name Environment).Environment | ForEach-Object { Write-Output "ENV: $_" }
+  ```
+
+Contributions
+- If you'd like the README expanded with CI publish steps or an automated publish-and-register flow, tell me what you'd prefer and I will add it.
