@@ -198,16 +198,48 @@ function Setup-ServiceFlow {
         Force = $true
     }
     Write-Output "Registering service using run-and-register.ps1..."
-    if (Test-Path .\run-and-register.ps1) {
-        & .\run-and-register.ps1 @callParams
+    # Prefer the script located next to this setup script (use PSScriptRoot for reliable location)
+    $scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $PSCommandPath }
+    $rootScript = Join-Path $scriptRoot 'run-and-register.ps1'
+    $toolsScript = Join-Path $scriptRoot 'tools\run-and-register.ps1'
+    if (Test-Path $rootScript) {
+        Write-Output "Calling $rootScript"
+        & $rootScript @callParams
     }
-    elseif (Test-Path .\tools\run-and-register.ps1) {
-        & .\tools\run-and-register.ps1 @callParams
+    elseif (Test-Path $toolsScript) {
+        Write-Output "Calling $toolsScript"
+        & $toolsScript @callParams
     }
     else {
-        Write-Error 'run-and-register.ps1 not found in repo root or tools folder.'
+        Write-Error "run-and-register.ps1 not found at $rootScript or $toolsScript"
         return
     }
+
+    # Wait briefly and ensure the service is restarted so it picks up new environment
+    try {
+        # Write-Output 'Waiting 2 seconds before restarting service...'
+        Start-Sleep -Seconds 2
+        if (Get-Service -Name 'RetaliqHosts' -ErrorAction SilentlyContinue) {
+            Restart-Service -Name 'RetaliqHosts' -Force -ErrorAction Stop
+
+            # Wait for service to reach Running state (up to 15s)
+            $attempts = 0
+            do {
+                Start-Sleep -Seconds 1
+                $svc = Get-Service -Name 'RetaliqHosts'
+                $attempts++
+            } while ($svc.Status -ne 'Running' -and $attempts -lt 15)
+
+            if ($svc.Status -eq 'Running') { Write-Output 'RetaliqHosts is running.' } else { Write-Warning "RetaliqHosts did not reach Running state (status: $($svc.Status))." }
+        }
+        else {
+            Write-Warning 'Service RetaliqHosts not found to restart.'
+        }
+    }
+    catch {
+        Write-Warning "Failed to restart/wait for service: $_"
+    }
+
 }
 
 function Reload-Service {
@@ -282,20 +314,52 @@ function Unregister-ServiceFlow {
     else { Write-Error 'unregister-service.ps1 not found' }
 }
 
+function Regenerate-ApiKeyFlow {
+    $envPath = Join-Path (Get-Location) '.env'
+    if (-not (Test-Path $envPath)) {
+        Write-Warning '.env not found. Run setup to create one first.'
+        return
+    }
+
+    $env = Read-Env $envPath
+    $old = $null
+    if ($env.ContainsKey('RETALIQ_API_KEY')) { $old = $env['RETALIQ_API_KEY'] }
+
+    $new = Generate-ApiKey
+    $env['RETALIQ_API_KEY'] = $new
+    Write-Env $envPath $env
+    Write-Output "Generated new RETALIQ_API_KEY: $new"
+
+    # update service environment and restart if service exists
+    if (Get-Service -Name 'RetaliqHosts' -ErrorAction SilentlyContinue) {
+        try {
+            Update-ServiceEnvironment -ServiceName 'RetaliqHosts' -EnvDict @{ RETALIQ_API_KEY = $new }
+            Restart-Service -Name 'RetaliqHosts' -Force -ErrorAction Stop
+            Write-Output 'Service restarted and new API key applied.'
+        }
+        catch {
+            Write-Warning "Failed to apply new API key to service: $_"
+        }
+    }
+    else {
+        Write-Warning 'Service RetaliqHosts not found; API key updated in .env only.'
+    }
+}
+
 # Interactive menu
 Write-Output "RetaliqHosts setup - choose an action:"
-Write-Output "1) Setup service"
-Write-Output "2) Reload service (apply .env to service and restart)"
-Write-Output "3) Unregister service"
-Write-Output "4) Append manual allowed IP(s) to service (no .env change)"
+Write-Output "1) Register service"
+Write-Output "2) Unregister service"
+Write-Output "3) Reload service (apply .env to service and restart)"
+Write-Output "4) Regenerate API key and apply to service"
 Write-Output "q) Quit"
 
 $choice = Read-Host "Enter choice [1/2/3/q]"
 switch ($choice) {
     '1' { Setup-ServiceFlow }
-    '2' { Reload-Service }
-    '3' { Unregister-ServiceFlow }
-    '4' { Append-ManualAllowedIp }
+    '2' { Unregister-ServiceFlow }
+    '3' { Reload-Service }
+    '4' { Regenerate-ApiKeyFlow }
     'q' { Write-Output 'Exit.' }
     default { Write-Warning 'Unknown choice' }
 }

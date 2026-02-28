@@ -126,17 +126,40 @@ if ($scriptToRun) {
     try {
         $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
         $existing = Get-ItemProperty -Path $regPath -Name 'Environment' -ErrorAction SilentlyContinue
+        # normalize existing environment into an array of strings
         $envs = @()
-        if ($existing) { $envs = $existing.Environment }
+        if ($existing) {
+            $raw = $existing.Environment
+            if ($raw -is [System.Array]) { $envs = $raw } elseif ($raw) { $envs = @($raw) }
+        }
+        $_allowedIps = "";
         if ($AllowedIps) {
             $envs = $envs | Where-Object { $_ -notlike 'RETALIQ_ALLOWED_IPS=*' }
             $envs += "RETALIQ_ALLOWED_IPS=$AllowedIps"
+            $_allowedIps = $AllowedIps
         }
+        $_apiKey = "";
         if ($ApiKey) {
             $envs = $envs | Where-Object { $_ -notlike 'RETALIQ_API_KEY=*' }
-            $envs += "RETALIQ_API_KEY=$ApiKey"
+            $envs += " RETALIQ_API_KEY=$ApiKey"
+            $_apiKey = $ApiKey
         }
-        if ($envs.Count -gt 0) { Set-ItemProperty -Path $regPath -Name 'Environment' -Value $envs -Force }
+        if ($envs.Count -gt 0) {
+            # Ensure we write a REG_MULTI_SZ value
+            try {
+               $rk = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Services\RetaliqHosts', $true)
+               $new = [string[]]@(
+                  "RETALIQ_ALLOWED_IPS=$_allowedIps",
+                  "RETALIQ_API_KEY=$_apiKey"
+               )
+               $rk.SetValue('Environment', $new, [Microsoft.Win32.RegistryValueKind]::MultiString)
+               $rk.Close()
+            }
+            catch {
+                Write-Warning "Failed to write registry Environment as MultiString, falling back: $_"
+                Set-ItemProperty -Path $regPath -Name 'Environment' -Value $envs -Force
+            }
+        }
     }
     catch {
         Write-Warning "Failed to set service environment variables: $_"
