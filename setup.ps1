@@ -148,6 +148,33 @@ function Get-WSLHostIP {
     catch { return $null }
 }
 
+function Get-IPHost {
+    try {
+        # 1. Collect all IPs into an array
+        $allIPs = @()
+        # Get Host IPs (filtering for active physical/virtual adapters)
+        $allIPs += (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notmatch '^127\.' }).IPAddress
+        # Get WSL IPs (using 'ip addr' to support BusyBox/Docker-Desktop distros)
+        $runningDistros = wsl --list --running --quiet | ForEach-Object { $_.Replace("`0", "").Trim() } | Where-Object { $_ }
+        foreach ($distro in $runningDistros) {
+            $wslIp = wsl -d $distro ip -o -4 addr show eth0 | ForEach-Object { ($_ -split ' +')[3].Split('/')[0] }
+            if ($wslIp) { $allIPs += $wslIp }
+        }
+        # Get Docker Container IPs
+        if (Get-Command docker -ErrorAction SilentlyContinue) {
+            $dockerIps = docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $(docker ps -q)
+            $allIPs += $dockerIps | Where-Object { $_ }
+        }
+        # 2. Filter for Unique addresses and Join with Comma
+        $uniqueIPs = $allIPs | Select-Object -Unique
+        $result = $uniqueIPs -join ","
+        return $result
+    } catch {
+        Write-Warning "Failed to get host IPs: $_"
+        return $null
+    }
+}
+
 function Resolve-DockerHostIP {
     try {
         $res = Resolve-DnsName host.docker.internal -ErrorAction SilentlyContinue
@@ -166,23 +193,19 @@ function Setup-ServiceFlow {
     $envPath = Join-Path (Get-Location) '.env'
     $env = Read-Env $envPath
 
-    if (-not $env.ContainsKey('RETALIQ_API_KEY') -or [string]::IsNullOrWhiteSpace($env['RETALIQ_API_KEY']) -or $env['RETALIQ_API_KEY'] -eq 'replace-with-strong-secret') {
+    Write-Output "Ensured .env file exists (status: $ensureResult)"
+
+    if ($ensureResult -eq 'overwritten') {
         $new = Generate-ApiKey
         $env['RETALIQ_API_KEY'] = $new
         Write-Output "Generated RETALIQ_API_KEY"
-    }
 
-    # build allowed list: prefer existing value in .env if present
-    if ($env.ContainsKey('RETALIQ_ALLOWED_IPS') -and -not [string]::IsNullOrWhiteSpace($env['RETALIQ_ALLOWED_IPS'])) {
-        Write-Output "Using existing RETALIQ_ALLOWED_IPS from .env: $($env['RETALIQ_ALLOWED_IPS'])"
-    }
-    else {
-        $allowed = @('127.0.0.1')
-        $wslip = Get-WSLHostIP
-        if ($wslip) { $allowed += $wslip }
-        $dockip = Resolve-DockerHostIP
-        if ($dockip) { $allowed += $dockip }
-        $env['RETALIQ_ALLOWED_IPS'] = ($allowed -join ',')
+        $allowed = '127.0.0.1'
+        $allIPs = Get-IPHost
+        if ($allIPs) {
+            $allowed += ",$allIPs";
+        }
+        $env['RETALIQ_ALLOWED_IPS'] = $allowed
         Write-Output "Set RETALIQ_ALLOWED_IPS to: $($env['RETALIQ_ALLOWED_IPS'])"
     }
 
@@ -245,16 +268,7 @@ function Setup-ServiceFlow {
 function Reload-Service {
     if (Get-Service -Name RetaliqHosts -ErrorAction SilentlyContinue) {
         # reload .env into service environment then restart
-        $envPath = Join-Path (Get-Location) '.env'
-        if (Test-Path $envPath) {
-            $env = Read-Env $envPath
-            $toSet = @{}
-            if ($env.ContainsKey('RETALIQ_API_KEY')) { $toSet.RETALIQ_API_KEY = $env['RETALIQ_API_KEY'] }
-            if ($env.ContainsKey('RETALIQ_ALLOWED_IPS')) { $toSet.RETALIQ_ALLOWED_IPS = $env['RETALIQ_ALLOWED_IPS'] }
-            if ($toSet.Count -gt 0) {
-                Update-ServiceEnvironment -ServiceName 'RetaliqHosts' -EnvDict $toSet
-            }
-        }
+        SetEnvFile -ServiceName RetaliqHosts
         Restart-Service -Name RetaliqHosts -Force
         Write-Output "Service restarted and .env applied to service environment."
     }
@@ -293,10 +307,7 @@ function Append-ManualAllowedIp {
     $ip = Read-Host 'Enter IP address to append to allowed list (comma separated allowed)'
     if ([string]::IsNullOrWhiteSpace($ip)) { Write-Warning 'No IP provided'; return }
     $items = $ip.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
-    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
-    $existing = Get-ItemProperty -Path $regPath -Name 'Environment' -ErrorAction SilentlyContinue
     $envs = @()
-    if ($existing) { $envs = $existing.Environment }
     $cur = @()
     $envEntry = $envs | Where-Object { $_ -like 'RETALIQ_ALLOWED_IPS=*' }
     if ($envEntry) { $cur = ($envEntry -replace '^RETALIQ_ALLOWED_IPS=','').Split(',') | ForEach-Object { $_.Trim() } }
@@ -304,9 +315,9 @@ function Append-ManualAllowedIp {
     # update envs
     $envs = $envs | Where-Object { $_ -notlike 'RETALIQ_ALLOWED_IPS=*' }
     $envs += "RETALIQ_ALLOWED_IPS=$($cur -join ',')"
-    Set-ItemProperty -Path $regPath -Name 'Environment' -Value $envs -Force
+    SetEnvFile -ServiceName $ServiceName
     Write-Output "Appended IP(s) to service allowed list and updated service environment"
-    Restart-Service -Name $ServiceName -Force
+    Restart-Service -Name RetaliqHosts -Force
 }
 
 function Unregister-ServiceFlow {
@@ -330,19 +341,39 @@ function Regenerate-ApiKeyFlow {
     Write-Env $envPath $env
     Write-Output "Generated new RETALIQ_API_KEY: $new"
 
-    # update service environment and restart if service exists
-    if (Get-Service -Name 'RetaliqHosts' -ErrorAction SilentlyContinue) {
-        try {
-            Update-ServiceEnvironment -ServiceName 'RetaliqHosts' -EnvDict @{ RETALIQ_API_KEY = $new }
-            Restart-Service -Name 'RetaliqHosts' -Force -ErrorAction Stop
-            Write-Output 'Service restarted and new API key applied.'
-        }
-        catch {
-            Write-Warning "Failed to apply new API key to service: $_"
+    SetEnvFile -ServiceName 'RetaliqHosts'
+
+    Restart-Service -Name RetaliqHosts -Force
+}
+
+function SetEnvFile {
+    param(
+        [string] $ServiceName = 'RetaliqHosts'
+    )
+    try {
+        $envPath = Join-Path (Get-Location) '.env'
+        $envs = Read-Env $envPath
+        $AllowedIps = $envs['RETALIQ_ALLOWED_IPS'] 
+        $ApiKey = $envs['RETALIQ_API_KEY'] 
+        if ($envs.Count -gt 0) {
+            # Ensure we write a REG_MULTI_SZ value
+            try {
+               $rk = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Services\RetaliqHosts', $true)
+               $new = [string[]]@(
+                  "RETALIQ_ALLOWED_IPS=$AllowedIps",
+                  "RETALIQ_API_KEY=$ApiKey"
+               )
+               $rk.SetValue('Environment', $new, [Microsoft.Win32.RegistryValueKind]::MultiString)
+               $rk.Close()
+            }
+            catch {
+                Write-Warning "Failed to write registry Environment as MultiString, falling back: $_"
+                Set-ItemProperty -Path $regPath -Name 'Environment' -Value $envs -Force
+            }
         }
     }
-    else {
-        Write-Warning 'Service RetaliqHosts not found; API key updated in .env only.'
+    catch {
+        Write-Warning "Failed to set service environment variables: $_"
     }
 }
 
@@ -354,7 +385,7 @@ Write-Output "3) Reload service (apply .env to service and restart)"
 Write-Output "4) Regenerate API key and apply to service"
 Write-Output "q) Quit"
 
-$choice = Read-Host "Enter choice [1/2/3/q]"
+$choice = Read-Host "Enter choice [1/2/3/4/q]"
 switch ($choice) {
     '1' { Setup-ServiceFlow }
     '2' { Unregister-ServiceFlow }
