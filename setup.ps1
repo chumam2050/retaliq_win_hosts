@@ -162,9 +162,16 @@ function Get-IPHost {
         }
         # Get Docker Container IPs
         if (Get-Command docker -ErrorAction SilentlyContinue) {
-            $dockerIps = docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $(docker ps -q)
-            $allIPs += $dockerIps | Where-Object { $_ }
+            $containerIds = docker ps -q
+            if ($containerIds) {
+                # If containers are running, grab their specific IPs
+                $allIPs += docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $containerIds | Where-Object { $_ }
+            } else {
+                # If no containers are running, append the default Docker Gateway/Bridge IP
+                $allIPs += "172.17.0.1"
+            }
         }
+
         # 2. Filter for Unique addresses and Join with Comma
         $uniqueIPs = $allIPs | Select-Object -Unique
         $result = $uniqueIPs -join ","
@@ -195,56 +202,44 @@ function Setup-ServiceFlow {
 
     Write-Output "Ensured .env file exists (status: $ensureResult)"
 
-    if ($ensureResult -eq 'overwritten') {
-        $new = Generate-ApiKey
-        $env['RETALIQ_API_KEY'] = $new
-        Write-Output "Generated RETALIQ_API_KEY"
-
-        $allowed = '127.0.0.1'
-        $allIPs = Get-IPHost
-        if ($allIPs) {
-            $allowed += ",$allIPs";
+    # If we created or overwrote the env file, generate defaults
+    if ($ensureResult -eq 'created' -or $ensureResult -eq 'overwritten') {
+        if (-not $env.ContainsKey('RETALIQ_API_KEY') -or [string]::IsNullOrWhiteSpace($env['RETALIQ_API_KEY']) -or $env['RETALIQ_API_KEY'] -eq 'replace-with-strong-secret') {
+            $new = Generate-ApiKey
+            $env['RETALIQ_API_KEY'] = $new
+            Write-Output "Generated RETALIQ_API_KEY"
         }
-        $env['RETALIQ_ALLOWED_IPS'] = $allowed
+
+        # Build allowed list with loopback + discovered addresses
+        $allowed = @('127.0.0.1')
+        $allIPs = Get-IPHost
+        if ($allIPs) { $allowed += $allIPs.Split(',') }
+        $env['RETALIQ_ALLOWED_IPS'] = ($allowed -join ',')
         Write-Output "Set RETALIQ_ALLOWED_IPS to: $($env['RETALIQ_ALLOWED_IPS'])"
+    }
+
+    # Ensure .env contains at least an API key
+    if (-not $env.ContainsKey('RETALIQ_API_KEY') -or [string]::IsNullOrWhiteSpace($env['RETALIQ_API_KEY'])) {
+        $env['RETALIQ_API_KEY'] = Generate-ApiKey
+        Write-Output 'Generated RETALIQ_API_KEY (missing)'
     }
 
     Write-Env $envPath $env
     Write-Output ".env updated with API key and allowed IPs"
 
-    # call run-and-register wrapper using named parameter splatting to avoid positional parsing issues
-    $callParams = @{
-        BuildDir = '.\build'
-        Arch = $arch
-        AllowedIps = $env['RETALIQ_ALLOWED_IPS']
-        ApiKey = $env['RETALIQ_API_KEY']
-        Force = $true
-    }
-    Write-Output "Registering service using run-and-register.ps1..."
-    # Prefer the script located next to this setup script (use PSScriptRoot for reliable location)
-    $scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $PSCommandPath }
-    $rootScript = Join-Path $scriptRoot 'run-and-register.ps1'
-    $toolsScript = Join-Path $scriptRoot 'tools\run-and-register.ps1'
-    if (Test-Path $rootScript) {
-        Write-Output "Calling $rootScript"
-        & $rootScript @callParams
-    }
-    elseif (Test-Path $toolsScript) {
-        Write-Output "Calling $toolsScript"
-        & $toolsScript @callParams
-    }
-    else {
-        Write-Error "run-and-register.ps1 not found at $rootScript or $toolsScript"
-        return
-    }
+    # Find the executable under build/<arch>
+    $exe = Find-ExeInBuild -BuildRoot (Join-Path (Get-Location) 'build') -Arch $arch -ExeName 'RetaliqHosts.exe'
+    if (-not $exe) { Write-Error 'Executable not found; cannot register service'; return }
 
-    # Wait briefly and ensure the service is restarted so it picks up new environment
+    # Register service and apply environment
+    Register-Service -ExePath $exe -ServiceName 'RetaliqHosts' -DisplayName 'RetaliqHosts Service' -Description 'Service that updates Windows hosts based on received payloads'
+
+    # Apply .env to service registry and restart
     try {
-        # Write-Output 'Waiting 2 seconds before restarting service...'
+        SetEnvFile -ServiceName 'RetaliqHosts'
         Start-Sleep -Seconds 2
         if (Get-Service -Name 'RetaliqHosts' -ErrorAction SilentlyContinue) {
             Restart-Service -Name 'RetaliqHosts' -Force -ErrorAction Stop
-
             # Wait for service to reach Running state (up to 15s)
             $attempts = 0
             do {
@@ -255,14 +250,122 @@ function Setup-ServiceFlow {
 
             if ($svc.Status -eq 'Running') { Write-Output 'RetaliqHosts is running.' } else { Write-Warning "RetaliqHosts did not reach Running state (status: $($svc.Status))." }
         }
-        else {
-            Write-Warning 'Service RetaliqHosts not found to restart.'
-        }
+        else { Write-Warning 'Service RetaliqHosts not found to restart.' }
     }
-    catch {
-        Write-Warning "Failed to restart/wait for service: $_"
+    catch { Write-Warning "Failed to restart/wait for service: $_" }
+
+}
+
+function Find-ExeInBuild {
+    param(
+        [string] $BuildRoot,
+        [string] $Arch,
+        [string] $ExeName
+    )
+    try {
+        $root = Resolve-Path -Path $BuildRoot -ErrorAction Stop | Select-Object -First 1 -ExpandProperty Path
+    }
+    catch { return $null }
+
+    $archNormalized = $Arch.ToLower()
+    if ($archNormalized -eq 'auto') { if ([Environment]::Is64BitOperatingSystem) { $archNormalized = 'x64' } else { $archNormalized = 'x86' } }
+    $archFolder = if ($archNormalized -eq 'x64') { 'win-x64' } elseif ($archNormalized -eq 'x86') { 'win-x86' } else { $archNormalized }
+
+    $candidate = Join-Path $root $archFolder
+    if (-not (Test-Path $candidate)) {
+        $alt64 = Join-Path $root 'win-x64'
+        $alt86 = Join-Path $root 'win-x86'
+        if (Test-Path $alt64) { $candidate = $alt64 }
+        elseif (Test-Path $alt86) { $candidate = $alt86 }
+        else { return $null }
     }
 
+    $path = Join-Path $candidate $ExeName
+    if (Test-Path $path) { return (Resolve-Path $path).Path }
+    $found = Get-ChildItem -Path $candidate -Filter $ExeName -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($found) { return $found.FullName }
+    return $null
+}
+
+function Register-Service {
+    param(
+        [string] $ExePath = "./publish/RetaliqHosts.exe",
+        [string] $ServiceName = "RetaliqHosts",
+        [string] $DisplayName = "RetaliqHosts Service",
+        [string] $Description = "Service that updates Windows hosts based on received payloads",
+        [string] $Username = '',
+        [string] $Password = ''
+    )
+
+    try {
+        $ExePathResolved = (Resolve-Path -Path $ExePath -ErrorAction Stop).Path
+    }
+    catch {
+        Write-Error "Executable not found at $ExePath. Publish the project first to create the binary."
+        exit 1
+    }
+
+    # Stop and remove existing service if present
+    if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+        Write-Output "Stopping existing service..."
+        Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+        Write-Output "Removing existing service..."
+        sc.exe delete $ServiceName | Out-Null
+        Start-Sleep -Seconds 1
+    }
+
+    # If a username is provided, ensure we have a password (prompt if not supplied)
+    $obj = 'LocalSystem'
+    $pwdPlain = ''
+    if (-not [string]::IsNullOrWhiteSpace($Username)) {
+        $obj = $Username
+        if ([string]::IsNullOrWhiteSpace($Password)) {
+            # Prompt for secure password
+            $secure = Read-Host -AsSecureString -Prompt "Enter service account password for $Username"
+            try {
+                $ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+                $pwdPlain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+                [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+            }
+            catch {
+                Write-Error "Failed to convert secure password to plain text."
+                exit 1
+            }
+        }
+        else {
+            $pwdPlain = $Password
+        }
+    }
+
+    Write-Output "Creating service $ServiceName pointing to $ExePath"
+
+    # Build sc.exe create command
+    $createArgs = @()
+    $createArgs += "create `"$ServiceName`""
+    $createArgs += "binPath= `"$ExePath`""
+    $createArgs += "DisplayName= `"$DisplayName`""
+    $createArgs += "start= auto"
+    $createArgs += "obj= `"$obj`""
+    if (-not [string]::IsNullOrEmpty($pwdPlain)) {
+        $createArgs += "password= `"$pwdPlain`""
+    }
+
+    $cmd = "sc.exe " + ($createArgs -join ' ')
+    Invoke-Expression $cmd
+
+    if ($LASTEXITCODE -eq 0) {
+        # Set description if provided
+        if (-not [string]::IsNullOrWhiteSpace($Description)) {
+            sc.exe description $ServiceName `"$Description`" | Out-Null
+        }
+
+        Write-Output "Service created. Sending start request..."
+        # Use sc.exe start to avoid PowerShell Start-Service blocking if the service does not reach Running state
+        sc.exe start $ServiceName | Out-Null
+        Write-Output "Start request sent. The service may take a moment to reach Running state."
+    } else {
+        Write-Error "Failed to create service"
+    }
 }
 
 function Reload-Service {
@@ -321,8 +424,38 @@ function Append-ManualAllowedIp {
 }
 
 function Unregister-ServiceFlow {
-    if (Test-Path .\unregister-service.ps1) { & .\unregister-service.ps1 -ServiceName RetaliqHosts }
-    else { Write-Error 'unregister-service.ps1 not found' }
+    param(
+        [string] $ServiceName = 'RetaliqHosts'
+    )
+
+    if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+        Write-Output "Stopping service $ServiceName..."
+        try { Stop-Service -Name $ServiceName -Force -ErrorAction Stop } catch { Write-Warning "Failed to stop service: $_" }
+
+        Write-Output "Removing service $ServiceName..."
+        try {
+            sc.exe delete $ServiceName | Out-Null
+            Start-Sleep -Seconds 1
+        }
+        catch { Write-Warning "Failed to delete service: $_" }
+
+        # cleanup Environment registry value if present
+        try {
+            $rk = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SYSTEM\CurrentControlSet\Services\$ServiceName", $true)
+            if ($rk -ne $null) {
+                if ($rk.GetValueNames() -contains 'Environment') {
+                    $rk.DeleteValue('Environment', $false)
+                }
+                $rk.Close()
+            }
+        }
+        catch { Write-Warning "Failed to clean service registry: $_" }
+
+        Write-Output "$ServiceName unregistered."
+    }
+    else {
+        Write-Warning "Service $ServiceName not found."
+    }
 }
 
 function Regenerate-ApiKeyFlow {
