@@ -48,6 +48,39 @@ namespace RetaliqHosts
                 _lifetime.StopApplication();
                 return;
             }
+            // Ensure running with administrator privileges on Windows when interactive.
+            // When running as a Windows Service (non-interactive) the service account (e.g. LocalSystem)
+            // typically has the required privileges; skip the interactive admin check so the service can start.
+            if (!System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+            {
+                _logger.LogError("RetaliqHosts is designed to run on Windows. Stopping application.");
+                _lifetime.StopApplication();
+                return;
+            }
+
+            // Only perform the explicit Administrator membership check when running interactively
+            // (developer running from console). Services run non-interactively and should not be
+            // terminated by this check.
+            if (Environment.UserInteractive)
+            {
+                try
+                {
+                    var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+                    var principal = new System.Security.Principal.WindowsPrincipal(identity);
+                    if (!principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator))
+                    {
+                        _logger.LogError("Administrator privileges are required to modify the hosts file. Stopping application.");
+                        _lifetime.StopApplication();
+                        return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to verify administrator privileges. Stopping application.");
+                    _lifetime.StopApplication();
+                    return;
+                }
+            }
 
             _logger.LogInformation("Worker running; HTTP endpoint handles payloads. Waiting for stop...");
             try

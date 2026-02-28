@@ -36,12 +36,15 @@ if (-not (Test-IsAdministrator)) {
 
 function Prompt-SelectArch {
     $is64 = [Environment]::Is64BitOperatingSystem
-    $default = if ($is64) { 'x64' } else { 'x86' }
-    Write-Output "Detected OS architecture: $default"
-    $choice = Read-Host "Select archive to install (x64/x86) [default: $default]"
+    $defaultShort = if ($is64) { 'x64' } else { 'x86' }
+    $default = if ($is64) { 'win-x64' } else { 'win-x86' }
+    Write-Host "Detected OS architecture: $defaultShort (using archive folder name $default)"
+    $choice = Read-Host "Select archive to install (win-x64/win-x86) [default: $default]"
     if ([string]::IsNullOrWhiteSpace($choice)) { return $default }
     $choice = $choice.Trim().ToLower()
-    if ($choice -in @('x64','x86')) { return $choice }
+    if ($choice -in @('win-x64','win-x86')) { return $choice }
+    # allow short forms
+    if ($choice -in @('x64','x86')) { if ($choice -eq 'x64') { return 'win-x64' } else { return 'win-x86' } }
     Write-Warning "Invalid choice, using default $default"
     return $default
 }
@@ -59,6 +62,13 @@ function Find-And-Unzip($arch, $buildRoot = '.\build', $force=$false) {
     }
 
     if (-not $zip) { Write-Error "No zip archive found for arch $arch under $buildRoot"; return $false }
+
+    # if not found, provide helpful listing
+    if (-not $zip) {
+        Write-Warning ("Search locations under {0}:" -f $buildRoot)
+        Get-ChildItem -Path $buildRoot -Filter '*.zip' -Recurse -File | ForEach-Object { Write-Output "  $($_.FullName)" }
+        return $false
+    }
 
     $outDir = Join-Path $buildRoot $arch
     if (Test-Path $outDir) {
@@ -82,10 +92,19 @@ function Ensure-EnvFile {
     if (-not (Test-Path $env)) {
         Copy-Item -Path $example -Destination $env
         Write-Output "Created .env from .env.example"
+        return 'created'
     }
     else {
         $c = Read-Host '.env already exists. Overwrite from example? (y/N)'
-        if ($c.ToLower() -eq 'y' -or $c.ToLower() -eq 'yes') { Copy-Item -Path $example -Destination $env -Force; Write-Output 'Overwritten .env' }
+        if ($c.ToLower() -eq 'y' -or $c.ToLower() -eq 'yes') {
+            Copy-Item -Path $example -Destination $env -Force
+            Write-Output 'Overwritten .env'
+            return 'overwritten'
+        }
+        else {
+            Write-Output 'Kept existing .env'
+            return 'kept'
+        }
     }
 }
 
@@ -143,7 +162,7 @@ function Setup-ServiceFlow {
     $arch = Prompt-SelectArch
     if (-not (Find-And-Unzip $arch '.\build' $true)) { Write-Error 'Failed to extract build archive'; return }
 
-    Ensure-EnvFile
+    $ensureResult = Ensure-EnvFile
     $envPath = Join-Path (Get-Location) '.env'
     $env = Read-Env $envPath
 
@@ -153,35 +172,109 @@ function Setup-ServiceFlow {
         Write-Output "Generated RETALIQ_API_KEY"
     }
 
-    # build allowed list: include loopback, wsl ip and docker host
-    $allowed = @('127.0.0.1')
-    $wslip = Get-WSLHostIP
-    if ($wslip) { $allowed += $wslip }
-    $dockip = Resolve-DockerHostIP
-    if ($dockip) { $allowed += $dockip }
-    $env['RETALIQ_ALLOWED_IPS'] = ($allowed -join ',')
+    # build allowed list: prefer existing value in .env if present
+    if ($env.ContainsKey('RETALIQ_ALLOWED_IPS') -and -not [string]::IsNullOrWhiteSpace($env['RETALIQ_ALLOWED_IPS'])) {
+        Write-Output "Using existing RETALIQ_ALLOWED_IPS from .env: $($env['RETALIQ_ALLOWED_IPS'])"
+    }
+    else {
+        $allowed = @('127.0.0.1')
+        $wslip = Get-WSLHostIP
+        if ($wslip) { $allowed += $wslip }
+        $dockip = Resolve-DockerHostIP
+        if ($dockip) { $allowed += $dockip }
+        $env['RETALIQ_ALLOWED_IPS'] = ($allowed -join ',')
+        Write-Output "Set RETALIQ_ALLOWED_IPS to: $($env['RETALIQ_ALLOWED_IPS'])"
+    }
 
     Write-Env $envPath $env
     Write-Output ".env updated with API key and allowed IPs"
 
-    # call run-and-register wrapper
-    $params = @(
-        '-BuildDir', '.\build',
-        '-Arch', $arch,
-        '-AllowedIps', $env['RETALIQ_ALLOWED_IPS'],
-        '-ApiKey', $env['RETALIQ_API_KEY'],
-        '-Force'
-    )
+    # call run-and-register wrapper using named parameter splatting to avoid positional parsing issues
+    $callParams = @{
+        BuildDir = '.\build'
+        Arch = $arch
+        AllowedIps = $env['RETALIQ_ALLOWED_IPS']
+        ApiKey = $env['RETALIQ_API_KEY']
+        Force = $true
+    }
     Write-Output "Registering service using run-and-register.ps1..."
-    & .\run-and-register.ps1 @params
+    if (Test-Path .\run-and-register.ps1) {
+        & .\run-and-register.ps1 @callParams
+    }
+    elseif (Test-Path .\tools\run-and-register.ps1) {
+        & .\tools\run-and-register.ps1 @callParams
+    }
+    else {
+        Write-Error 'run-and-register.ps1 not found in repo root or tools folder.'
+        return
+    }
 }
 
 function Reload-Service {
     if (Get-Service -Name RetaliqHosts -ErrorAction SilentlyContinue) {
+        # reload .env into service environment then restart
+        $envPath = Join-Path (Get-Location) '.env'
+        if (Test-Path $envPath) {
+            $env = Read-Env $envPath
+            $toSet = @{}
+            if ($env.ContainsKey('RETALIQ_API_KEY')) { $toSet.RETALIQ_API_KEY = $env['RETALIQ_API_KEY'] }
+            if ($env.ContainsKey('RETALIQ_ALLOWED_IPS')) { $toSet.RETALIQ_ALLOWED_IPS = $env['RETALIQ_ALLOWED_IPS'] }
+            if ($toSet.Count -gt 0) {
+                Update-ServiceEnvironment -ServiceName 'RetaliqHosts' -EnvDict $toSet
+            }
+        }
         Restart-Service -Name RetaliqHosts -Force
-        Write-Output "Service restarted."
+        Write-Output "Service restarted and .env applied to service environment."
     }
     else { Write-Warning "Service RetaliqHosts not found." }
+}
+
+function Update-ServiceEnvironment {
+    param(
+        [string] $ServiceName,
+        [hashtable] $EnvDict
+    )
+    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    try {
+        $existing = Get-ItemProperty -Path $regPath -Name 'Environment' -ErrorAction SilentlyContinue
+        $envs = @()
+        if ($existing) { $envs = $existing.Environment }
+        # remove keys that we will set
+        foreach ($k in $EnvDict.Keys) {
+            $envs = $envs | Where-Object { $_ -notlike "$k=*" }
+        }
+        foreach ($k in $EnvDict.Keys) {
+            $envs += "$k=$($EnvDict[$k])"
+        }
+        Set-ItemProperty -Path $regPath -Name 'Environment' -Value $envs -Force
+        Write-Output "Service registry environment updated for $ServiceName"
+    }
+    catch {
+        throw $_
+    }
+}
+
+function Append-ManualAllowedIp {
+    param(
+        [string] $ServiceName = 'RetaliqHosts'
+    )
+    $ip = Read-Host 'Enter IP address to append to allowed list (comma separated allowed)'
+    if ([string]::IsNullOrWhiteSpace($ip)) { Write-Warning 'No IP provided'; return }
+    $items = $ip.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    $existing = Get-ItemProperty -Path $regPath -Name 'Environment' -ErrorAction SilentlyContinue
+    $envs = @()
+    if ($existing) { $envs = $existing.Environment }
+    $cur = @()
+    $envEntry = $envs | Where-Object { $_ -like 'RETALIQ_ALLOWED_IPS=*' }
+    if ($envEntry) { $cur = ($envEntry -replace '^RETALIQ_ALLOWED_IPS=','').Split(',') | ForEach-Object { $_.Trim() } }
+    foreach ($it in $items) { if ($cur -notcontains $it) { $cur += $it } }
+    # update envs
+    $envs = $envs | Where-Object { $_ -notlike 'RETALIQ_ALLOWED_IPS=*' }
+    $envs += "RETALIQ_ALLOWED_IPS=$($cur -join ',')"
+    Set-ItemProperty -Path $regPath -Name 'Environment' -Value $envs -Force
+    Write-Output "Appended IP(s) to service allowed list and updated service environment"
+    Restart-Service -Name $ServiceName -Force
 }
 
 function Unregister-ServiceFlow {
@@ -192,8 +285,9 @@ function Unregister-ServiceFlow {
 # Interactive menu
 Write-Output "RetaliqHosts setup - choose an action:"
 Write-Output "1) Setup service"
-Write-Output "2) Reload service"
+Write-Output "2) Reload service (apply .env to service and restart)"
 Write-Output "3) Unregister service"
+Write-Output "4) Append manual allowed IP(s) to service (no .env change)"
 Write-Output "q) Quit"
 
 $choice = Read-Host "Enter choice [1/2/3/q]"
@@ -201,6 +295,7 @@ switch ($choice) {
     '1' { Setup-ServiceFlow }
     '2' { Reload-Service }
     '3' { Unregister-ServiceFlow }
+    '4' { Append-ManualAllowedIp }
     'q' { Write-Output 'Exit.' }
     default { Write-Warning 'Unknown choice' }
 }
